@@ -14,6 +14,10 @@ ENV/
 apk_analysis_*.json
 apk_analysis_*.md
 
+# Decompilation output
+jadx_output/
+apktool_output/
+
 # Temporary files
 *.tmp
 *.temp

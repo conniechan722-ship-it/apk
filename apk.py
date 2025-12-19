@@ -56,6 +56,26 @@ OLLAMA_PATH = find_ollama_path()
 DEFAULT_MODEL = 'qwen2.5:32b'
 
 
+def find_decompiler_tools() -> Dict[str, str]:
+    """查找反编译工具"""
+    tools = {}
+    # 查找 jadx
+    jadx_path = shutil.which('jadx')
+    if jadx_path:
+        tools['jadx'] = jadx_path
+        print(f"✓ 找到 jadx: {jadx_path}")
+    # 查找 apktool
+    apktool_path = shutil.which('apktool')
+    if apktool_path:
+        tools['apktool'] = apktool_path
+        print(f"✓ 找到 apktool: {apktool_path}")
+    
+    if not tools:
+        print("⚠️  未找到反编译工具 (jadx/apktool)")
+    
+    return tools
+
+
 def get_ollama_models() -> List[str]:
     """获取 Ollama 已安装的模型列表"""
     try:
@@ -85,10 +105,14 @@ def get_ollama_models() -> List[str]:
 class APKExtractor:
     """APK信息提取器"""
    
-    def __init__(self, apk_path: str):
+    def __init__(self, apk_path: str, enable_decompile: bool = False, output_dir: str = None):
         self.apk_path = apk_path
         self.temp_dir = tempfile.mkdtemp()
         self.extracted_info = {}
+        self.enable_decompile = enable_decompile
+        self.output_dir = output_dir or tempfile.mkdtemp()
+        self.decompile_dir = None
+        self.decompiler_tools = find_decompiler_tools() if enable_decompile else {}
        
     def extract_basic_structure(self) -> Dict[str, Any]:
         """提取APK基本结构"""
@@ -349,6 +373,456 @@ class APKExtractor:
            
         return signature_info
    
+    def detect_packer(self) -> Dict[str, Any]:
+        """检测加壳"""
+        print("\n🛡️  正在检测加壳...")
+       
+        packer_info = {
+            "is_packed": False,
+            "packer_name": None,
+            "confidence": 0,
+            "indicators": [],
+            "entry_class": None,
+            "difficulty": "未知"
+        }
+       
+        # 加壳特征库
+        packer_signatures = {
+            "360加固": {
+                "signatures": ["com.stub.StubApp", "com.qihoo.util", "com.qihoo360", "libjiagu"],
+                "difficulty": "中"
+            },
+            "腾讯乐固": {
+                "signatures": ["com.tencent.StubShell", "com.tencent.bugly", "libtup", "libshell"],
+                "difficulty": "高"
+            },
+            "梆梆加固": {
+                "signatures": ["com.secneo.apkwrapper", "com.bangcle", "libsecexe", "libDexHelper"],
+                "difficulty": "高"
+            },
+            "爱加密": {
+                "signatures": ["com.ijiami", "s.h.e.l.l", "libijiami", "libexec"],
+                "difficulty": "中高"
+            },
+            "娜迦加固": {
+                "signatures": ["com.nagain", "com.naga", "libnaga", "libddog"],
+                "difficulty": "中"
+            },
+            "阿里聚安全": {
+                "signatures": ["com.alibaba.wireless.security", "libsgmain", "libmobisec"],
+                "difficulty": "高"
+            },
+            "百度加固": {
+                "signatures": ["com.baidu.protect", "libbaiduprotect"],
+                "difficulty": "中"
+            },
+            "网易易盾": {
+                "signatures": ["com.netease.nis", "libnesec"],
+                "difficulty": "中高"
+            },
+            "顶象加固": {
+                "signatures": ["com.dingxiang.mobile", "libdxshield"],
+                "difficulty": "高"
+            },
+        }
+       
+        try:
+            # 检查DEX文件中的类名
+            dex_files = []
+            for dex_file in self.extracted_info.get('structure', {}).get('dex_files', []):
+                dex_path = os.path.join(self.temp_dir, dex_file)
+                if os.path.exists(dex_path):
+                    dex_files.append(dex_path)
+           
+            # 简单的特征检测：检查文件列表中的关键字
+            all_files = self.extracted_info.get('structure', {}).get('file_list', [])
+            so_files = self.extracted_info.get('structure', {}).get('so_files', [])
+           
+            matched_packers = []
+            for packer_name, packer_data in packer_signatures.items():
+                signatures = packer_data['signatures']
+                matches = []
+               
+                # 检查文件路径中的特征
+                for signature in signatures:
+                    for file_path in all_files + so_files:
+                        if signature.lower() in file_path.lower():
+                            matches.append(f"文件路径包含: {signature}")
+                            break
+               
+                if matches:
+                    matched_packers.append({
+                        "name": packer_name,
+                        "matches": matches,
+                        "confidence": len(matches) * 30,  # 简单的置信度计算
+                        "difficulty": packer_data['difficulty']
+                    })
+           
+            # 选择置信度最高的加壳方案
+            if matched_packers:
+                matched_packers.sort(key=lambda x: x['confidence'], reverse=True)
+                best_match = matched_packers[0]
+               
+                packer_info["is_packed"] = True
+                packer_info["packer_name"] = best_match['name']
+                packer_info["confidence"] = min(best_match['confidence'], 90)
+                packer_info["indicators"] = best_match['matches']
+                packer_info["difficulty"] = best_match['difficulty']
+               
+                print(f"  ⚠️  检测到加壳: {best_match['name']}")
+                print(f"  ⚠️  置信度: {packer_info['confidence']}%")
+                print(f"  ⚠️  脱壳难度: {best_match['difficulty']}")
+            else:
+                print(f"  ✓ 未检测到常见加壳")
+               
+        except Exception as e:
+            print(f"  ✗ 加壳检测失败: {e}")
+           
+        return packer_info
+   
+    def detect_obfuscation(self) -> Dict[str, Any]:
+        """检测混淆"""
+        print("\n🔀 正在检测混淆...")
+       
+        obfuscation_info = {
+            "is_obfuscated": False,
+            "obfuscation_level": 0,  # 1-10
+            "identifier_obfuscation": False,
+            "string_encryption": False,
+            "control_flow_obfuscation": False,
+            "details": {
+                "short_names_ratio": 0,
+                "single_char_names": 0,
+                "obfuscated_packages": []
+            }
+        }
+       
+        try:
+            # 分析包名和类名特征
+            package_name = self.extracted_info.get('manifest', {}).get('package_name', '')
+           
+            # 检测包名混淆
+            if package_name:
+                # 检查是否有短类名或单字符包名
+                package_parts = package_name.split('.')
+                short_parts = [p for p in package_parts if len(p) <= 2]
+               
+                if short_parts:
+                    obfuscation_info["identifier_obfuscation"] = True
+                    obfuscation_info["details"]["obfuscated_packages"].append(package_name)
+           
+            # 分析DEX文件数量和大小
+            dex_count = self.extracted_info.get('dex', {}).get('count', 0)
+            if dex_count > 1:
+                # 多DEX可能暗示使用了混淆
+                obfuscation_info["obfuscation_level"] += 2
+           
+            # 检查是否有ProGuard/R8的映射文件
+            all_files = self.extracted_info.get('structure', {}).get('file_list', [])
+            has_mapping = any('mapping' in f.lower() or 'proguard' in f.lower() for f in all_files)
+           
+            # 分析Native库（混淆通常会有native代码）
+            native_count = len(self.extracted_info.get('native', {}).get('libraries', []))
+            if native_count > 3:
+                obfuscation_info["obfuscation_level"] += 1
+           
+            # 估算混淆等级
+            if obfuscation_info["identifier_obfuscation"]:
+                obfuscation_info["obfuscation_level"] += 3
+                obfuscation_info["is_obfuscated"] = True
+           
+            if has_mapping:
+                obfuscation_info["obfuscation_level"] += 2
+                obfuscation_info["is_obfuscated"] = True
+           
+            # 检测可能的字符串加密（通过检测加密相关的库）
+            crypto_libs = [lib['name'] for lib in self.extracted_info.get('native', {}).get('libraries', [])
+                          if any(keyword in lib['name'].lower() for keyword in ['crypto', 'cipher', 'encrypt'])]
+            if crypto_libs:
+                obfuscation_info["string_encryption"] = True
+                obfuscation_info["obfuscation_level"] += 2
+           
+            # 限制在1-10范围内
+            obfuscation_info["obfuscation_level"] = min(obfuscation_info["obfuscation_level"], 10)
+           
+            if obfuscation_info["is_obfuscated"]:
+                print(f"  ⚠️  检测到代码混淆")
+                print(f"  ⚠️  混淆等级: {obfuscation_info['obfuscation_level']}/10")
+            else:
+                print(f"  ✓ 未检测到明显混淆")
+               
+        except Exception as e:
+            print(f"  ✗ 混淆检测失败: {e}")
+           
+        return obfuscation_info
+   
+    def decompile_apk(self) -> Dict[str, Any]:
+        """反编译APK"""
+        print("\n🔓 正在反编译APK...")
+       
+        decompile_info = {
+            "success": False,
+            "method": None,
+            "output_dir": None,
+            "java_sources": [],
+            "smali_sources": [],
+            "error": None
+        }
+       
+        if not self.enable_decompile:
+            print("  ⚠️  反编译功能未启用")
+            return decompile_info
+       
+        if not self.decompiler_tools:
+            print("  ⚠️  未找到反编译工具")
+            decompile_info["error"] = "未找到反编译工具"
+            return decompile_info
+       
+        try:
+            # 尝试使用jadx反编译
+            if 'jadx' in self.decompiler_tools:
+                print("  → 使用jadx进行反编译...")
+                jadx_output = os.path.join(self.output_dir, 'jadx_output')
+                os.makedirs(jadx_output, exist_ok=True)
+               
+                result = subprocess.run(
+                    [self.decompiler_tools['jadx'], '-d', jadx_output, self.apk_path, '--show-bad-code'],
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5分钟超时
+                )
+               
+                if result.returncode == 0 or os.path.exists(os.path.join(jadx_output, 'sources')):
+                    decompile_info["success"] = True
+                    decompile_info["method"] = "jadx"
+                    decompile_info["output_dir"] = jadx_output
+                    self.decompile_dir = jadx_output
+                   
+                    # 统计反编译的Java文件
+                    sources_dir = os.path.join(jadx_output, 'sources')
+                    if os.path.exists(sources_dir):
+                        for root, dirs, files in os.walk(sources_dir):
+                            for file in files:
+                                if file.endswith('.java'):
+                                    rel_path = os.path.relpath(os.path.join(root, file), sources_dir)
+                                    decompile_info["java_sources"].append(rel_path)
+                   
+                    print(f"  ✓ jadx反编译成功")
+                    print(f"  ✓ 输出目录: {jadx_output}")
+                    print(f"  ✓ Java源文件数: {len(decompile_info['java_sources'])}")
+                else:
+                    print(f"  ✗ jadx反编译失败: {result.stderr}")
+           
+            # 尝试使用apktool反编译
+            if 'apktool' in self.decompiler_tools and not decompile_info["success"]:
+                print("  → 使用apktool进行反编译...")
+                apktool_output = os.path.join(self.output_dir, 'apktool_output')
+                os.makedirs(apktool_output, exist_ok=True)
+               
+                result = subprocess.run(
+                    [self.decompiler_tools['apktool'], 'd', self.apk_path, '-o', apktool_output, '-f'],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+               
+                if result.returncode == 0 and os.path.exists(apktool_output):
+                    decompile_info["success"] = True
+                    decompile_info["method"] = "apktool"
+                    decompile_info["output_dir"] = apktool_output
+                    self.decompile_dir = apktool_output
+                   
+                    # 统计反编译的Smali文件
+                    smali_dir = os.path.join(apktool_output, 'smali')
+                    if os.path.exists(smali_dir):
+                        for root, dirs, files in os.walk(smali_dir):
+                            for file in files:
+                                if file.endswith('.smali'):
+                                    rel_path = os.path.relpath(os.path.join(root, file), smali_dir)
+                                    decompile_info["smali_sources"].append(rel_path)
+                   
+                    print(f"  ✓ apktool反编译成功")
+                    print(f"  ✓ 输出目录: {apktool_output}")
+                    print(f"  ✓ Smali源文件数: {len(decompile_info['smali_sources'])}")
+                else:
+                    print(f"  ✗ apktool反编译失败: {result.stderr}")
+                    decompile_info["error"] = result.stderr
+           
+        except subprocess.TimeoutExpired:
+            print(f"  ✗ 反编译超时")
+            decompile_info["error"] = "反编译超时"
+        except Exception as e:
+            print(f"  ✗ 反编译失败: {e}")
+            decompile_info["error"] = str(e)
+           
+        return decompile_info
+   
+    def analyze_code_logic(self, decompile_info: Dict[str, Any]) -> Dict[str, Any]:
+        """分析代码逻辑"""
+        print("\n🧠 正在分析代码逻辑...")
+       
+        logic_info = {
+            "entry_points": [],      # 入口点
+            "key_classes": [],       # 关键类
+            "sensitive_methods": [], # 敏感方法
+            "modifiable_points": [], # 可修改点
+            "hook_suggestions": []   # Hook 建议
+        }
+       
+        if not decompile_info.get("success"):
+            print("  ⚠️  反编译未成功，跳过代码逻辑分析")
+            return logic_info
+       
+        try:
+            decompile_dir = decompile_info.get("output_dir")
+            if not decompile_dir or not os.path.exists(decompile_dir):
+                print("  ⚠️  反编译目录不存在")
+                return logic_info
+           
+            # 分析AndroidManifest.xml（从apktool输出）
+            manifest_path = os.path.join(decompile_dir, 'AndroidManifest.xml')
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    manifest_content = f.read()
+                   
+                # 提取Activity
+                activities = re.findall(r'<activity[^>]*android:name="([^"]+)"', manifest_content)
+                for activity in activities[:10]:  # 限制数量
+                    logic_info["entry_points"].append({
+                        "type": "Activity",
+                        "name": activity,
+                        "description": "应用界面入口"
+                    })
+                    logic_info["key_classes"].append(activity)
+               
+                # 提取Service
+                services = re.findall(r'<service[^>]*android:name="([^"]+)"', manifest_content)
+                for service in services[:10]:
+                    logic_info["entry_points"].append({
+                        "type": "Service",
+                        "name": service,
+                        "description": "后台服务"
+                    })
+                    logic_info["key_classes"].append(service)
+               
+                # 提取BroadcastReceiver
+                receivers = re.findall(r'<receiver[^>]*android:name="([^"]+)"', manifest_content)
+                for receiver in receivers[:10]:
+                    logic_info["entry_points"].append({
+                        "type": "BroadcastReceiver",
+                        "name": receiver,
+                        "description": "广播接收器"
+                    })
+                    logic_info["key_classes"].append(receiver)
+           
+            # 分析Java/Smali源代码，查找敏感方法
+            sources_dir = os.path.join(decompile_dir, 'sources')
+            smali_dir = os.path.join(decompile_dir, 'smali')
+           
+            # 敏感关键词
+            sensitive_keywords = {
+                "网络请求": ["HttpURLConnection", "OkHttp", "Retrofit", "URLConnection", "HttpClient"],
+                "文件操作": ["FileOutputStream", "FileInputStream", "File.write", "File.read"],
+                "加密解密": ["Cipher", "MessageDigest", "SecretKey", "encrypt", "decrypt", "AES", "DES", "RSA"],
+                "签名验证": ["Signature", "PackageManager.GET_SIGNATURES", "checkSignature", "verifySignature"],
+                "动态加载": ["DexClassLoader", "PathClassLoader", "loadClass", "loadDex"],
+                "反射调用": ["Class.forName", "Method.invoke", "getDeclaredMethod"],
+                "Native调用": ["System.loadLibrary", "JNI", "native "],
+                "数据库操作": ["SQLiteDatabase", "ContentProvider", "query", "insert", "update"],
+                "SharedPreferences": ["SharedPreferences", "getSharedPreferences", "edit().put"],
+                "Root检测": ["su", "Superuser", "isRooted", "checkRoot"]
+            }
+           
+            # 扫描Java源文件
+            if os.path.exists(sources_dir):
+                java_files = decompile_info.get("java_sources", [])[:50]  # 限制扫描文件数
+                for java_file in java_files:
+                    file_path = os.path.join(sources_dir, java_file)
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                               
+                            for category, keywords in sensitive_keywords.items():
+                                for keyword in keywords:
+                                    if keyword in content:
+                                        logic_info["sensitive_methods"].append({
+                                            "category": category,
+                                            "keyword": keyword,
+                                            "file": java_file,
+                                            "description": f"在{java_file}中发现{category}操作"
+                                        })
+                                        break
+                        except Exception:
+                            continue
+           
+            # 生成可修改点建议
+            if logic_info["sensitive_methods"]:
+                # 签名验证相关
+                signature_related = [m for m in logic_info["sensitive_methods"] if m["category"] == "签名验证"]
+                if signature_related:
+                    logic_info["modifiable_points"].append({
+                        "point": "签名验证绕过",
+                        "description": "检测到签名验证代码，可以通过修改验证逻辑绕过签名检查",
+                        "files": [m["file"] for m in signature_related],
+                        "difficulty": "中"
+                    })
+               
+                # 网络请求相关
+                network_related = [m for m in logic_info["sensitive_methods"] if m["category"] == "网络请求"]
+                if network_related:
+                    logic_info["modifiable_points"].append({
+                        "point": "API地址修改",
+                        "description": "检测到网络请求代码，可以修改API服务器地址",
+                        "files": list(set([m["file"] for m in network_related])),
+                        "difficulty": "低"
+                    })
+               
+                # Root检测相关
+                root_related = [m for m in logic_info["sensitive_methods"] if m["category"] == "Root检测"]
+                if root_related:
+                    logic_info["modifiable_points"].append({
+                        "point": "Root检测绕过",
+                        "description": "检测到Root检测代码，可以修改检测逻辑",
+                        "files": [m["file"] for m in root_related],
+                        "difficulty": "低"
+                    })
+           
+            # 生成Hook建议
+            if logic_info["key_classes"]:
+                logic_info["hook_suggestions"].append({
+                    "target": "Application入口",
+                    "classes": [c for c in logic_info["key_classes"] if "Application" in c],
+                    "method": "onCreate",
+                    "reason": "Hook应用启动流程，可以在应用启动时执行自定义代码"
+                })
+           
+            if any(m["category"] == "加密解密" for m in logic_info["sensitive_methods"]):
+                logic_info["hook_suggestions"].append({
+                    "target": "加密解密方法",
+                    "classes": ["javax.crypto.Cipher"],
+                    "method": "doFinal",
+                    "reason": "Hook加密解密方法，可以获取明文数据"
+                })
+           
+            if any(m["category"] == "网络请求" for m in logic_info["sensitive_methods"]):
+                logic_info["hook_suggestions"].append({
+                    "target": "网络请求",
+                    "classes": ["okhttp3.OkHttpClient", "java.net.HttpURLConnection"],
+                    "method": "execute / connect",
+                    "reason": "Hook网络请求，可以查看或修改请求内容"
+                })
+           
+            print(f"  ✓ 发现 {len(logic_info['entry_points'])} 个入口点")
+            print(f"  ✓ 发现 {len(logic_info['sensitive_methods'])} 个敏感方法")
+            print(f"  ✓ 识别 {len(logic_info['modifiable_points'])} 个可修改点")
+            print(f"  ✓ 生成 {len(logic_info['hook_suggestions'])} 个Hook建议")
+           
+        except Exception as e:
+            print(f"  ✗ 代码逻辑分析失败: {e}")
+           
+        return logic_info
+   
     def extract_all(self) -> Dict[str, Any]:
         """提取所有APK信息"""
         print("\n" + "="*80)
@@ -366,6 +840,9 @@ class APKExtractor:
         all_info["native"] = self.analyze_native_libs(all_info["structure"])
         all_info["resources"] = self.extract_resources_info()
         all_info["signature"] = self.analyze_signature()
+       
+        # Store for later use by other methods
+        self.extracted_info = all_info
        
         return all_info
    
@@ -573,14 +1050,97 @@ class AITeam:
 class APKAnalysisOrchestrator:
     """APK分析编排器"""
    
-    def __init__(self, models: List[str], apk_path: str, requirements: str = ""):
+    def __init__(self, models: List[str], apk_path: str, requirements: str = "", 
+                 enable_decompile: bool = False, output_dir: str = None):
         self.models = models
         self.apk_path = apk_path
         self.requirements = requirements
-        self.extractor = APKExtractor(apk_path)
+        self.enable_decompile = enable_decompile
+        self.output_dir = output_dir
+        self.extractor = APKExtractor(apk_path, enable_decompile, output_dir)
         self.apk_info = {}
         self.analysis_results = []
+        self.packer_info = {}
+        self.obfuscation_info = {}
+        self.decompile_info = {}
+        self.code_logic_info = {}
        
+    async def analyze_packer_and_obfuscation(self) -> Dict[str, Any]:
+        """分析0: 加壳与混淆检测"""
+        print("\n" + "="*80)
+        print("阶段 0: 加壳与混淆检测")
+        print("="*80)
+       
+        # 执行检测
+        self.packer_info = self.extractor.detect_packer()
+        self.obfuscation_info = self.extractor.detect_obfuscation()
+       
+        # 如果启用了反编译，执行反编译
+        if self.enable_decompile:
+            self.decompile_info = self.extractor.decompile_apk()
+       
+        team = AITeam(0, "加壳与混淆分析专家", self.models)
+       
+        task = f"""
+请分析以下APK的加壳与混淆情况:
+
+【加壳检测结果】
+- 是否加壳: {self.packer_info.get('is_packed', False)}
+- 加壳方案: {self.packer_info.get('packer_name', '无')}
+- 置信度: {self.packer_info.get('confidence', 0)}%
+- 脱壳难度: {self.packer_info.get('difficulty', '未知')}
+- 检测指标: {', '.join(self.packer_info.get('indicators', []))}
+
+【混淆检测结果】
+- 是否混淆: {self.obfuscation_info.get('is_obfuscated', False)}
+- 混淆等级: {self.obfuscation_info.get('obfuscation_level', 0)}/10
+- 标识符混淆: {self.obfuscation_info.get('identifier_obfuscation', False)}
+- 字符串加密: {self.obfuscation_info.get('string_encryption', False)}
+- 控制流混淆: {self.obfuscation_info.get('control_flow_obfuscation', False)}
+
+【反编译情况】
+- 反编译启用: {self.enable_decompile}
+- 反编译成功: {self.decompile_info.get('success', False)}
+- 反编译方法: {self.decompile_info.get('method', '未执行')}
+- Java源文件数: {len(self.decompile_info.get('java_sources', []))}
+- Smali源文件数: {len(self.decompile_info.get('smali_sources', []))}
+
+请从以下角度进行分析:
+
+1. **加壳技术评估**:
+   - 加壳方案的特点和强度
+   - 脱壳的难度和方法建议
+   - 加壳对逆向分析的影响
+
+2. **混淆技术评估**:
+   - 混淆方案的类型（ProGuard/R8/DexGuard等）
+   - 混淆强度和覆盖范围
+   - 反混淆的难度和策略
+
+3. **综合保护评估**:
+   - 加壳+混淆的组合效果
+   - 整体保护强度评分
+   - 逆向工程的切入点
+
+4. **分析建议**:
+   - 推荐的分析工具和方法
+   - 绕过保护的策略
+   - 需要注意的难点
+"""
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供专业的加壳与混淆分析报告。\n"
+       
+        result = await team.collaborate(task, json.dumps({
+            "packer": self.packer_info,
+            "obfuscation": self.obfuscation_info,
+            "decompile": self.decompile_info
+        }, ensure_ascii=False, indent=2))
+        self.analysis_results.append(result)
+        return result
+   
     async def analyze_structure_and_metadata(self) -> Dict[str, Any]:
         """分析1: APK构成与元数据"""
         print("\n" + "="*80)
@@ -1133,13 +1693,91 @@ DEX文件数: {self.apk_info['dex']['count']}
         self.analysis_results.append(result)
         return result
    
+    async def analyze_code_logic_and_modifiable_points(self) -> Dict[str, Any]:
+        """分析9: 代码逻辑分析与可修改点识别"""
+        print("\n" + "="*80)
+        print("阶段 9: 代码逻辑分析与可修改点识别")
+        print("="*80)
+       
+        # 执行代码逻辑分析
+        self.code_logic_info = self.extractor.analyze_code_logic(self.decompile_info)
+       
+        team = AITeam(9, "代码逻辑分析与修改建议专家", self.models)
+       
+        task = f"""
+请基于反编译结果分析APK的代码逻辑和可修改点:
+
+【入口点分析】
+发现 {len(self.code_logic_info.get('entry_points', []))} 个入口点:
+{chr(10).join(f"- {ep.get('type')}: {ep.get('name')}" for ep in self.code_logic_info.get('entry_points', [])[:20])}
+
+【关键类】
+{chr(10).join(f"- {cls}" for cls in self.code_logic_info.get('key_classes', [])[:20])}
+
+【敏感方法】
+发现 {len(self.code_logic_info.get('sensitive_methods', []))} 个敏感方法:
+{chr(10).join(f"- {sm.get('category')}: {sm.get('keyword')} ({sm.get('file')})" for sm in self.code_logic_info.get('sensitive_methods', [])[:20])}
+
+【可修改点】
+{chr(10).join(f"- {mp.get('point')}: {mp.get('description')}" for mp in self.code_logic_info.get('modifiable_points', []))}
+
+【Hook建议】
+{chr(10).join(f"- {hs.get('target')}: {hs.get('reason')}" for hs in self.code_logic_info.get('hook_suggestions', []))}
+
+请从以下角度进行深入分析:
+
+1. **代码架构分析**:
+   - 应用的整体架构模式
+   - 模块划分和职责
+   - 关键业务流程
+
+2. **敏感操作识别**:
+   - 网络通信实现细节
+   - 数据加密和存储方式
+   - 权限使用和敏感API调用
+   - 安全检测机制
+
+3. **可修改点详细分析**:
+   - 每个修改点的具体位置
+   - 修改的技术方案
+   - 修改的风险和难度
+   - 修改后的影响范围
+
+4. **Hook方案设计**:
+   - Frida Hook脚本建议
+   - Hook时机和顺序
+   - 需要Hook的具体方法
+   - Hook可能遇到的问题
+
+5. **逆向工程路线**:
+   - 分析的切入点
+   - 关键代码定位方法
+   - 动静态结合分析策略
+   - 调试和测试方法
+
+6. **修改实施建议**:
+   - 重打包流程
+   - 签名处理
+   - 防检测措施
+   - 测试验证方法
+"""
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供详细的代码逻辑分析和修改建议报告。\n"
+       
+        result = await team.collaborate(task, json.dumps(self.code_logic_info, ensure_ascii=False, indent=2))
+        self.analysis_results.append(result)
+        return result
+   
     async def generate_comprehensive_report(self) -> Dict[str, Any]:
         """生成综合分析报告"""
         print("\n" + "="*80)
-        print("阶段 9: 综合分析报告生成")
+        print("阶段 10: 综合分析报告生成")
         print("="*80)
        
-        team = AITeam(9, "安全分析总结专家", self.models)
+        team = AITeam(10, "安全分析总结专家", self.models)
        
         # 汇总所有分析结果
         all_analyses = "\n\n".join([
@@ -1148,7 +1786,7 @@ DEX文件数: {self.apk_info['dex']['count']}
         ])
        
         task = f"""
-基于以下8个维度的深入分析结果，请生成一份综合性的APK安全分析报告:
+基于以下多个维度的深入分析结果，请生成一份综合性的APK安全分析报告:
 
 {all_analyses}
 
@@ -1172,7 +1810,8 @@ DEX文件数: {self.apk_info['dex']['count']}
    - 合规性分析
 
 4. **代码保护评估**:
-   - 混淆加固总结
+   - 加壳检测结果: {self.packer_info.get('packer_name', '无')}
+   - 混淆等级: {self.obfuscation_info.get('obfuscation_level', 0)}/10
    - 反调试能力
    - 逆向工程难度
 
@@ -1181,19 +1820,30 @@ DEX文件数: {self.apk_info['dex']['count']}
    - 敏感操作汇总
    - 潜在风险点
 
-6. **建议与改进**:
+6. **代码逻辑与可修改点**:
+   - 入口点数量: {len(self.code_logic_info.get('entry_points', []))}
+   - 敏感方法数量: {len(self.code_logic_info.get('sensitive_methods', []))}
+   - 可修改点列表: {', '.join([mp.get('point', '') for mp in self.code_logic_info.get('modifiable_points', [])])}
+   - Hook建议数量: {len(self.code_logic_info.get('hook_suggestions', []))}
+
+7. **建议与改进**:
    - 安全加固建议
    - 隐私保护改进
    - 合规性建议
    - 最佳实践推荐
 
-7. **渗透测试路线**:
+8. **渗透测试路线**:
    - 分析切入点
    - 测试方法建议
    - 工具选择推荐
    - 预期挑战
 
-8. **评分矩阵**:
+9. **脱壳/去混淆建议**:
+   - 脱壳方法和工具
+   - 去混淆策略
+   - 预期难度和时间
+
+10. **评分矩阵**:
    - 安全性评分 (1-10)
    - 隐私保护评分 (1-10)
    - 代码质量评分 (1-10)
@@ -1221,6 +1871,7 @@ DEX文件数: {self.apk_info['dex']['count']}
        
         # 定义分析阶段
         stages = [
+            ("加壳与混淆检测", self.analyze_packer_and_obfuscation),
             ("APK构成与元数据", self.analyze_structure_and_metadata),
             ("静态代码结构", self.analyze_static_code_structure),
             ("混淆与加固", self.analyze_obfuscation_hardening),
@@ -1229,8 +1880,14 @@ DEX文件数: {self.apk_info['dex']['count']}
             ("网络协议", self.analyze_network_protocol),
             ("签名完整性", self.analyze_signature_integrity),
             ("反调试机制", self.analyze_anti_analysis),
-            ("综合报告生成", self.generate_comprehensive_report),
         ]
+       
+        # 如果启用了反编译，添加代码逻辑分析阶段
+        if self.enable_decompile and self.decompile_info.get('success'):
+            stages.append(("代码逻辑与可修改点", self.analyze_code_logic_and_modifiable_points))
+       
+        # 添加综合报告生成阶段
+        stages.append(("综合报告生成", self.generate_comprehensive_report))
        
         # 使用进度条执行分析
         with tqdm(total=len(stages), desc="APK分析进度", unit="阶段") as pbar:
@@ -1241,6 +1898,8 @@ DEX文件数: {self.apk_info['dex']['count']}
                     pbar.update(1)
                 except Exception as e:
                     print(f"\n❌ 错误: {stage_name} 分析失败: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # 继续执行下一个阶段
                     pbar.update(1)
        
@@ -1259,11 +1918,21 @@ DEX文件数: {self.apk_info['dex']['count']}
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         apk_name = Path(self.apk_path).stem
        
-        # 保存JSON格式
-        output_file = f"apk_analysis_{apk_name}_{timestamp}.json"
+        # 确定输出目录
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+            output_file = os.path.join(self.output_dir, f"apk_analysis_{apk_name}_{timestamp}.json")
+            markdown_file = os.path.join(self.output_dir, f"apk_analysis_{apk_name}_{timestamp}.md")
+        else:
+            output_file = f"apk_analysis_{apk_name}_{timestamp}.json"
+            markdown_file = f"apk_analysis_{apk_name}_{timestamp}.md"
        
         output_data = {
             "apk_info": self.apk_info,
+            "packer_info": self.packer_info,
+            "obfuscation_info": self.obfuscation_info,
+            "decompile_info": self.decompile_info,
+            "code_logic_info": self.code_logic_info,
             "analysis_results": self.analysis_results,
             "timestamp": datetime.now().isoformat(),
             "models_used": self.models
@@ -1277,7 +1946,6 @@ DEX文件数: {self.apk_info['dex']['count']}
             print(f"\n✗ 保存JSON失败: {e}")
        
         # 保存Markdown格式
-        markdown_file = f"apk_analysis_{apk_name}_{timestamp}.md"
         try:
             with open(markdown_file, 'w', encoding='utf-8') as f:
                 f.write(f"# APK深度安全分析报告\n\n")
@@ -1292,6 +1960,43 @@ DEX文件数: {self.apk_info['dex']['count']}
                 f.write(f"- **最小SDK:** {self.apk_info['manifest'].get('min_sdk', '未知')}\n")
                 f.write(f"- **目标SDK:** {self.apk_info['manifest'].get('target_sdk', '未知')}\n")
                 f.write(f"- **APK大小:** {round(self.apk_info['structure']['total_size'] / 1024 / 1024, 2)} MB\n\n")
+               
+                # 加壳检测结果
+                f.write(f"## 加壳检测\n\n")
+                f.write(f"- **是否加壳:** {self.packer_info.get('is_packed', False)}\n")
+                if self.packer_info.get('is_packed'):
+                    f.write(f"- **加壳方案:** {self.packer_info.get('packer_name', '未知')}\n")
+                    f.write(f"- **置信度:** {self.packer_info.get('confidence', 0)}%\n")
+                    f.write(f"- **脱壳难度:** {self.packer_info.get('difficulty', '未知')}\n")
+                f.write(f"\n")
+               
+                # 混淆检测结果
+                f.write(f"## 混淆检测\n\n")
+                f.write(f"- **是否混淆:** {self.obfuscation_info.get('is_obfuscated', False)}\n")
+                f.write(f"- **混淆等级:** {self.obfuscation_info.get('obfuscation_level', 0)}/10\n")
+                f.write(f"- **标识符混淆:** {self.obfuscation_info.get('identifier_obfuscation', False)}\n")
+                f.write(f"- **字符串加密:** {self.obfuscation_info.get('string_encryption', False)}\n\n")
+               
+                # 代码逻辑分析结果
+                if self.code_logic_info:
+                    f.write(f"## 代码逻辑分析\n\n")
+                    f.write(f"- **入口点数量:** {len(self.code_logic_info.get('entry_points', []))}\n")
+                    f.write(f"- **关键类数量:** {len(self.code_logic_info.get('key_classes', []))}\n")
+                    f.write(f"- **敏感方法数量:** {len(self.code_logic_info.get('sensitive_methods', []))}\n")
+                    f.write(f"- **可修改点数量:** {len(self.code_logic_info.get('modifiable_points', []))}\n")
+                    f.write(f"- **Hook建议数量:** {len(self.code_logic_info.get('hook_suggestions', []))}\n\n")
+                   
+                    if self.code_logic_info.get('modifiable_points'):
+                        f.write(f"### 可修改点列表\n\n")
+                        for mp in self.code_logic_info.get('modifiable_points', []):
+                            f.write(f"- **{mp.get('point')}**: {mp.get('description')} (难度: {mp.get('difficulty')})\n")
+                        f.write(f"\n")
+                   
+                    if self.code_logic_info.get('hook_suggestions'):
+                        f.write(f"### Hook建议\n\n")
+                        for hs in self.code_logic_info.get('hook_suggestions', []):
+                            f.write(f"- **{hs.get('target')}**: {hs.get('reason')}\n")
+                        f.write(f"\n")
                
                 f.write(f"---\n\n")
                
@@ -1312,19 +2017,33 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
+  # 基本分析（交互选择模型）
   python apk.py --apk app.apk
+
+  # 指定模型
   python apk.py --apk app.apk --model qwen2.5-coder:7b
+
+  # 启用反编译分析
+  python apk.py --apk app.apk --model qwen2.5-coder:7b --decompile
+
+  # 导入需求文件
   python apk.py --apk app.apk --model qwen2.5-coder:7b --txt requirements.txt
+
+  # 完整分析
+  python apk.py --apk app.apk --model qwen2.5-coder:7b --decompile --txt requirements.txt --output-dir ./output
 
 注意: 需要安装以下工具以获得更完整的分析结果:
   - aapt (Android Asset Packaging Tool)
-  - apktool (APK反编译工具)
+  - jadx (APK反编译为Java代码，使用 --decompile 时需要)
+  - apktool (APK反编译为Smali代码，使用 --decompile 时需要)
         """
     )
    
     parser.add_argument('--apk', required=True, help='APK文件路径')
     parser.add_argument('--model', help='指定要使用的Ollama模型（可选）')
     parser.add_argument('--txt', help='需求方向文件路径（可选）')
+    parser.add_argument('--decompile', action='store_true', help='启用反编译分析')
+    parser.add_argument('--output-dir', help='输出目录（可选）')
    
     args = parser.parse_args()
    
@@ -1404,7 +2123,9 @@ async def main():
     orchestrator = APKAnalysisOrchestrator(
         models=[model],
         apk_path=args.apk,
-        requirements=requirements
+        requirements=requirements,
+        enable_decompile=args.decompile,
+        output_dir=args.output_dir
     )
    
     # 开始分析
