@@ -66,10 +66,14 @@ def get_ollama_models() -> List[str]:
         if result.returncode == 0:
             lines = result.stdout.strip().split('\n')
             models = []
-            for line in lines[1:]:  # 跳过标题行
-                if line.strip():
-                    model_name = line.split()[0]
-                    models.append(model_name)
+            # 检查是否至少有标题行和一行数据
+            if len(lines) > 1:
+                for line in lines[1:]:  # 跳过标题行
+                    if line.strip():
+                        parts = line.split()
+                        if parts:  # 确保行不为空
+                            model_name = parts[0]
+                            models.append(model_name)
             return models
     except Exception as e:
         print(f"获取模型列表失败: {e}")
@@ -1229,9 +1233,14 @@ DEX文件数: {self.apk_info['dex']['count']}
         # 使用进度条执行分析
         with tqdm(total=len(stages), desc="APK分析进度", unit="阶段") as pbar:
             for stage_name, stage_func in stages:
-                pbar.set_description(f"正在分析: {stage_name}")
-                await stage_func()
-                pbar.update(1)
+                try:
+                    pbar.set_description(f"正在分析: {stage_name}")
+                    await stage_func()
+                    pbar.update(1)
+                except Exception as e:
+                    print(f"\n❌ 错误: {stage_name} 分析失败: {e}")
+                    # 继续执行下一个阶段
+                    pbar.update(1)
        
         # 步骤4: 保存结果
         self.save_results()
@@ -1364,7 +1373,9 @@ async def main():
             for i, m in enumerate(available_models, 1):
                 print(f"  {i}. {m}")
             
-            while True:
+            max_attempts = 5
+            attempts = 0
+            while attempts < max_attempts:
                 try:
                     choice = input(f"\n请选择模型 (1-{len(available_models)}): ").strip()
                     choice_idx = int(choice) - 1
@@ -1374,11 +1385,18 @@ async def main():
                         break
                     else:
                         print(f"❌ 请输入 1 到 {len(available_models)} 之间的数字")
+                        attempts += 1
                 except ValueError:
                     print("❌ 请输入有效的数字")
-                except KeyboardInterrupt:
+                    attempts += 1
+                except (KeyboardInterrupt, EOFError):
                     print("\n\n用户取消操作")
                     sys.exit(0)
+            
+            if attempts >= max_attempts:
+                print(f"\n❌ 错误: 超过最大尝试次数，使用默认模型")
+                model = available_models[0] if available_models else 'qwen2.5:32b'
+                print(f"✓ 使用模型: {model}")
    
     # 创建分析编排器
     orchestrator = APKAnalysisOrchestrator(
