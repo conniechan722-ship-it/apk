@@ -435,13 +435,6 @@ class APKExtractor:
         }
        
         try:
-            # 检查DEX文件中的类名
-            dex_files = []
-            for dex_file in self.extracted_info.get('structure', {}).get('dex_files', []):
-                dex_path = os.path.join(self.temp_dir, dex_file)
-                if os.path.exists(dex_path):
-                    dex_files.append(dex_path)
-           
             # 简单的特征检测：检查文件列表中的关键字
             all_files = self.extracted_info.get('structure', {}).get('file_list', [])
             so_files = self.extracted_info.get('structure', {}).get('so_files', [])
@@ -462,7 +455,7 @@ class APKExtractor:
                     matched_packers.append({
                         "name": packer_name,
                         "matches": matches,
-                        "confidence": len(matches) * PACKER_CONFIDENCE_MULTIPLIER,  # 简单的置信度计算
+                        "confidence": min(len(matches) * PACKER_CONFIDENCE_MULTIPLIER, 90),  # 限制最大90%
                         "difficulty": packer_data['difficulty']
                     })
            
@@ -1872,9 +1865,17 @@ DEX文件数: {self.apk_info['dex']['count']}
         # 步骤1: 提取APK信息
         self.apk_info = self.extractor.extract_all()
        
-        # 定义分析阶段 - 先定义前面的固定阶段
+        # 步骤2: 执行阶段0 - 加壳与混淆检测（必须在extract_all之后）
+        # 这个阶段需要先执行，因为它会进行反编译，我们需要知道反编译是否成功
+        print("\n执行阶段 0: 加壳与混淆检测...")
+        try:
+            await self.analyze_packer_and_obfuscation()
+        except Exception as e:
+            print(f"\n❌ 错误: 加壳与混淆检测失败: {e}")
+            traceback.print_exc()
+       
+        # 步骤3: 定义后续分析阶段
         stages = [
-            ("加壳与混淆检测", self.analyze_packer_and_obfuscation),
             ("APK构成与元数据", self.analyze_structure_and_metadata),
             ("静态代码结构", self.analyze_static_code_structure),
             ("混淆与加固", self.analyze_obfuscation_hardening),
@@ -1885,18 +1886,6 @@ DEX文件数: {self.apk_info['dex']['count']}
             ("反调试机制", self.analyze_anti_analysis),
         ]
        
-        # 使用进度条执行前面的分析阶段
-        # 我们需要先运行stage 0来知道decompile是否成功
-        print("\n执行阶段 0: 加壳与混淆检测...")
-        try:
-            await self.analyze_packer_and_obfuscation()
-        except Exception as e:
-            print(f"\n❌ 错误: 加壳与混淆检测失败: {e}")
-            traceback.print_exc()
-       
-        # 移除第一个阶段，因为已经执行了
-        stages = stages[1:]
-       
         # 如果启用了反编译且成功，添加代码逻辑分析阶段
         if self.enable_decompile and self.decompile_info.get('success'):
             stages.append(("代码逻辑与可修改点", self.analyze_code_logic_and_modifiable_points))
@@ -1904,8 +1893,9 @@ DEX文件数: {self.apk_info['dex']['count']}
         # 添加综合报告生成阶段
         stages.append(("综合报告生成", self.generate_comprehensive_report))
        
-        # 使用进度条执行剩余分析
-        with tqdm(total=len(stages), desc="APK分析进度", unit="阶段", initial=1) as pbar:
+        # 步骤4: 使用进度条执行后续分析
+        total_stages = 1 + len(stages)  # 1 for stage 0 already executed
+        with tqdm(total=total_stages, desc="APK分析进度", unit="阶段", initial=1) as pbar:
             for stage_name, stage_func in stages:
                 try:
                     pbar.set_description(f"正在分析: {stage_name}")
@@ -1917,7 +1907,7 @@ DEX文件数: {self.apk_info['dex']['count']}
                     # 继续执行下一个阶段
                     pbar.update(1)
        
-        # 步骤4: 保存结果
+        # 步骤5: 保存结果
         self.save_results()
        
         # 清理临时文件
