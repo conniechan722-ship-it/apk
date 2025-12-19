@@ -17,7 +17,15 @@ import re
 import subprocess
 import zipfile
 import tempfile
+import random
+import traceback
 from tqdm import tqdm
+
+
+# 常量定义
+DECOMPILE_TIMEOUT = 300  # 反编译超时时间（秒）
+PACKER_CONFIDENCE_MULTIPLIER = 30  # 加壳检测置信度乘数
+MAX_SCAN_FILES = 50  # 代码扫描最大文件数
 
 
 def find_ollama_path() -> str:
@@ -454,7 +462,7 @@ class APKExtractor:
                     matched_packers.append({
                         "name": packer_name,
                         "matches": matches,
-                        "confidence": len(matches) * 30,  # 简单的置信度计算
+                        "confidence": len(matches) * PACKER_CONFIDENCE_MULTIPLIER,  # 简单的置信度计算
                         "difficulty": packer_data['difficulty']
                     })
            
@@ -589,7 +597,7 @@ class APKExtractor:
                     [self.decompiler_tools['jadx'], '-d', jadx_output, self.apk_path, '--show-bad-code'],
                     capture_output=True,
                     text=True,
-                    timeout=300  # 5分钟超时
+                    timeout=DECOMPILE_TIMEOUT  # 反编译超时
                 )
                
                 if result.returncode == 0 or os.path.exists(os.path.join(jadx_output, 'sources')):
@@ -623,7 +631,7 @@ class APKExtractor:
                     [self.decompiler_tools['apktool'], 'd', self.apk_path, '-o', apktool_output, '-f'],
                     capture_output=True,
                     text=True,
-                    timeout=300
+                    timeout=DECOMPILE_TIMEOUT
                 )
                
                 if result.returncode == 0 and os.path.exists(apktool_output):
@@ -735,7 +743,7 @@ class APKExtractor:
            
             # 扫描Java源文件
             if os.path.exists(sources_dir):
-                java_files = decompile_info.get("java_sources", [])[:50]  # 限制扫描文件数
+                java_files = decompile_info.get("java_sources", [])[:MAX_SCAN_FILES]  # 限制扫描文件数
                 for java_file in java_files:
                     file_path = os.path.join(sources_dir, java_file)
                     if os.path.exists(file_path):
@@ -932,15 +940,12 @@ class AIAgent:
                     return vote
                 else:
                     valid_votes = [i for i in range(1, 7) if i != self.agent_id]
-                    import random
                     return random.choice(valid_votes)
             else:
                 valid_votes = [i for i in range(1, 7) if i != self.agent_id]
-                import random
                 return random.choice(valid_votes)
         except:
             valid_votes = [i for i in range(1, 7) if i != self.agent_id]
-            import random
             return random.choice(valid_votes)
 
 
@@ -1024,11 +1029,9 @@ class AITeam:
             eliminated = [c for c in candidates if c['votes'] == min_votes]
            
             if len(eliminated) == len(candidates):
-                import random
                 eliminated = [random.choice(candidates)]
            
             if len(eliminated) > 1:
-                import random
                 eliminated = [random.choice(eliminated)]
            
             print(f"\n❌ 淘汰分析 {eliminated[0]['agent_id']} (得票 {eliminated[0]['votes']})")
@@ -1869,7 +1872,7 @@ DEX文件数: {self.apk_info['dex']['count']}
         # 步骤1: 提取APK信息
         self.apk_info = self.extractor.extract_all()
        
-        # 定义分析阶段
+        # 定义分析阶段 - 先定义前面的固定阶段
         stages = [
             ("加壳与混淆检测", self.analyze_packer_and_obfuscation),
             ("APK构成与元数据", self.analyze_structure_and_metadata),
@@ -1882,15 +1885,27 @@ DEX文件数: {self.apk_info['dex']['count']}
             ("反调试机制", self.analyze_anti_analysis),
         ]
        
-        # 如果启用了反编译，添加代码逻辑分析阶段
+        # 使用进度条执行前面的分析阶段
+        # 我们需要先运行stage 0来知道decompile是否成功
+        print("\n执行阶段 0: 加壳与混淆检测...")
+        try:
+            await self.analyze_packer_and_obfuscation()
+        except Exception as e:
+            print(f"\n❌ 错误: 加壳与混淆检测失败: {e}")
+            traceback.print_exc()
+       
+        # 移除第一个阶段，因为已经执行了
+        stages = stages[1:]
+       
+        # 如果启用了反编译且成功，添加代码逻辑分析阶段
         if self.enable_decompile and self.decompile_info.get('success'):
             stages.append(("代码逻辑与可修改点", self.analyze_code_logic_and_modifiable_points))
        
         # 添加综合报告生成阶段
         stages.append(("综合报告生成", self.generate_comprehensive_report))
        
-        # 使用进度条执行分析
-        with tqdm(total=len(stages), desc="APK分析进度", unit="阶段") as pbar:
+        # 使用进度条执行剩余分析
+        with tqdm(total=len(stages), desc="APK分析进度", unit="阶段", initial=1) as pbar:
             for stage_name, stage_func in stages:
                 try:
                     pbar.set_description(f"正在分析: {stage_name}")
@@ -1898,7 +1913,6 @@ DEX文件数: {self.apk_info['dex']['count']}
                     pbar.update(1)
                 except Exception as e:
                     print(f"\n❌ 错误: {stage_name} 分析失败: {e}")
-                    import traceback
                     traceback.print_exc()
                     # 继续执行下一个阶段
                     pbar.update(1)
