@@ -17,6 +17,7 @@ import re
 import subprocess
 import zipfile
 import tempfile
+from tqdm import tqdm
 
 
 def find_ollama_path() -> str:
@@ -52,6 +53,33 @@ def find_ollama_path() -> str:
 
 
 OLLAMA_PATH = find_ollama_path()
+DEFAULT_MODEL = 'qwen2.5:32b'
+
+
+def get_ollama_models() -> List[str]:
+    """获取 Ollama 已安装的模型列表"""
+    try:
+        result = subprocess.run(
+            [OLLAMA_PATH, 'list'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            models = []
+            # 检查是否至少有标题行和一行数据
+            if len(lines) > 1:
+                for line in lines[1:]:  # 跳过标题行
+                    if line.strip():
+                        parts = line.split()
+                        if parts:  # 确保行不为空
+                            model_name = parts[0]
+                            models.append(model_name)
+            return models
+    except Exception as e:
+        print(f"⚠️  获取Ollama模型列表失败: {e}")
+        print(f"    请确保Ollama正在运行并且可以访问")
+    return []
 
 
 class APKExtractor:
@@ -545,9 +573,10 @@ class AITeam:
 class APKAnalysisOrchestrator:
     """APK分析编排器"""
    
-    def __init__(self, models: List[str], apk_path: str):
+    def __init__(self, models: List[str], apk_path: str, requirements: str = ""):
         self.models = models
         self.apk_path = apk_path
+        self.requirements = requirements
         self.extractor = APKExtractor(apk_path)
         self.apk_info = {}
         self.analysis_results = []
@@ -597,9 +626,12 @@ class APKAnalysisOrchestrator:
 5. **签名与证书**: 签名版本、证书链完整性、防篡改机制
 6. **Assets**: 特殊资源、配置文件、潜在的动态内容
 7. **整体评估**: 应用规模、复杂度、可能的技术栈
-
-请提供专业、详细的分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供专业、详细的分析报告。\n"
        
         result = await team.collaborate(task, "")
         self.analysis_results.append(result)
@@ -655,9 +687,12 @@ class APKAnalysisOrchestrator:
    - 代码规模评估
    - 维护复杂度
    - 潜在的代码质量问题
-
-请提供详细的静态分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供详细的静态分析报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -714,9 +749,12 @@ class APKAnalysisOrchestrator:
    - 动态分析难度
    - 逆向工程复杂度
    - 建议的分析策略
-
-请提供专业的混淆与加固分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供专业的混淆与加固分析报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -785,9 +823,12 @@ class APKAnalysisOrchestrator:
    - Hook点推荐
    - 监控重点
    - Frida脚本思路
-
-请提供详细的动态行为分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供详细的动态行为分析报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -849,9 +890,12 @@ Native代码占比: {round(self.apk_info['native']['total_size'] / self.apk_info
    - Native代码使用的合理性
    - 性能关键路径
    - 内存管理策略
-
-请提供专业的Native代码分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供专业的Native代码分析报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -920,9 +964,12 @@ Native库: {', '.join([lib['name'] for lib in self.apk_info['native']['libraries
    - 证书绕过策略
    - 关键接口识别
    - 流量重放测试
-
-请提供详细的网络协议分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供详细的网络协议分析报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -991,9 +1038,12 @@ Native库: {', '.join([lib['name'] for lib in self.apk_info['native']['libraries
    - 签名加固建议
    - 完整性保护增强
    - 更新机制改进
-
-请提供专业的签名与完整性分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供专业的签名与完整性分析报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -1072,9 +1122,12 @@ DEX文件数: {self.apk_info['dex']['count']}
    - 推荐的分析工具
    - 绕过技术路线
    - 自动化分析可行性
-
-请提供详细的反调试与反分析评估报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请提供详细的反调试与反分析评估报告。\n"
        
         result = await team.collaborate(task, json.dumps(self.apk_info, ensure_ascii=False, indent=2))
         self.analysis_results.append(result)
@@ -1146,9 +1199,12 @@ DEX文件数: {self.apk_info['dex']['count']}
    - 代码质量评分 (1-10)
    - 逆向难度评分 (1-10)
    - 整体评级
-
-请生成一份专业、全面、有深度的综合分析报告。
 """
+       
+        if self.requirements:
+            task += f"\n\n【分析需求方向】\n{self.requirements}\n"
+       
+        task += "\n请生成一份专业、全面、有深度的综合分析报告。\n"
        
         result = await team.collaborate(task, all_analyses)
         self.analysis_results.append(result)
@@ -1163,18 +1219,30 @@ DEX文件数: {self.apk_info['dex']['count']}
         # 步骤1: 提取APK信息
         self.apk_info = self.extractor.extract_all()
        
-        # 步骤2: 8个维度深入分析
-        await self.analyze_structure_and_metadata()      # 1. APK构成与元数据
-        await self.analyze_static_code_structure()       # 2. 静态代码结构
-        await self.analyze_obfuscation_hardening()       # 3. 混淆与加固
-        await self.analyze_dynamic_behavior()            # 4. 动态行为
-        await self.analyze_native_code()                 # 5. Native代码
-        await self.analyze_network_protocol()            # 6. 网络协议
-        await self.analyze_signature_integrity()         # 7. 签名完整性
-        await self.analyze_anti_analysis()               # 8. 反调试机制
+        # 定义分析阶段
+        stages = [
+            ("APK构成与元数据", self.analyze_structure_and_metadata),
+            ("静态代码结构", self.analyze_static_code_structure),
+            ("混淆与加固", self.analyze_obfuscation_hardening),
+            ("动态行为", self.analyze_dynamic_behavior),
+            ("Native代码", self.analyze_native_code),
+            ("网络协议", self.analyze_network_protocol),
+            ("签名完整性", self.analyze_signature_integrity),
+            ("反调试机制", self.analyze_anti_analysis),
+            ("综合报告生成", self.generate_comprehensive_report),
+        ]
        
-        # 步骤3: 生成综合报告
-        await self.generate_comprehensive_report()
+        # 使用进度条执行分析
+        with tqdm(total=len(stages), desc="APK分析进度", unit="阶段") as pbar:
+            for stage_name, stage_func in stages:
+                try:
+                    pbar.set_description(f"正在分析: {stage_name}")
+                    await stage_func()
+                    pbar.update(1)
+                except Exception as e:
+                    print(f"\n❌ 错误: {stage_name} 分析失败: {e}")
+                    # 继续执行下一个阶段
+                    pbar.update(1)
        
         # 步骤4: 保存结果
         self.save_results()
@@ -1244,9 +1312,9 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  python apk_analyzer.py --apk app.apk
-  python apk_analyzer.py --apk app.apk --models qwen2.5:32b llama3:8b
-  python apk_analyzer.py --apk app.apk --models deepseek-r1:32b
+  python apk.py --apk app.apk
+  python apk.py --apk app.apk --model qwen2.5-coder:7b
+  python apk.py --apk app.apk --model qwen2.5-coder:7b --txt requirements.txt
 
 注意: 需要安装以下工具以获得更完整的分析结果:
   - aapt (Android Asset Packaging Tool)
@@ -1255,7 +1323,8 @@ async def main():
     )
    
     parser.add_argument('--apk', required=True, help='APK文件路径')
-    parser.add_argument('--models', nargs='+', help='指定要使用的Ollama模型（可选）')
+    parser.add_argument('--model', help='指定要使用的Ollama模型（可选）')
+    parser.add_argument('--txt', help='需求方向文件路径（可选）')
    
     args = parser.parse_args()
    
@@ -1264,18 +1333,78 @@ async def main():
         print(f"❌ 错误: APK文件不存在: {args.apk}")
         sys.exit(1)
    
-    # 使用用户指定的模型，或使用默认模型
-    if args.models:
-        models = args.models
-        print(f"✓ 使用指定模型: {', '.join(models)}")
+    # 读取需求文件
+    requirements = ""
+    if args.txt:
+        if not os.path.exists(args.txt):
+            print(f"❌ 错误: 需求文件不存在: {args.txt}")
+            sys.exit(1)
+        try:
+            with open(args.txt, 'r', encoding='utf-8') as f:
+                requirements = f.read()
+            print(f"✓ 已加载需求文件: {args.txt}")
+        except Exception as e:
+            print(f"❌ 错误: 无法读取需求文件: {e}")
+            sys.exit(1)
+   
+    # 处理模型选择
+    model = None
+    if args.model:
+        # 用户指定了模型，验证模型是否存在
+        available_models = get_ollama_models()
+        if not available_models:
+            print("⚠️  警告: 无法获取模型列表，将尝试使用指定的模型")
+            model = args.model
+        elif args.model in available_models:
+            model = args.model
+            print(f"✓ 使用指定模型: {model}")
+        else:
+            print(f"❌ 错误: 模型 '{args.model}' 不存在")
+            print(f"可用的模型列表:")
+            for i, m in enumerate(available_models, 1):
+                print(f"  {i}. {m}")
+            sys.exit(1)
     else:
-        models = ['qwen2.5:32b']
-        print(f"✓ 使用默认模型: {', '.join(models)}")
+        # 用户未指定模型，显示列表让用户选择
+        available_models = get_ollama_models()
+        if not available_models:
+            print("⚠️  警告: 无法获取模型列表，使用默认模型")
+            model = DEFAULT_MODEL
+        else:
+            print("\n可用的Ollama模型列表:")
+            for i, m in enumerate(available_models, 1):
+                print(f"  {i}. {m}")
+            
+            max_attempts = 5
+            attempts = 0
+            while attempts < max_attempts:
+                try:
+                    choice = input(f"\n请选择模型 (1-{len(available_models)}): ").strip()
+                    choice_idx = int(choice) - 1
+                    if 0 <= choice_idx < len(available_models):
+                        model = available_models[choice_idx]
+                        print(f"✓ 已选择模型: {model}")
+                        break
+                    else:
+                        print(f"❌ 请输入 1 到 {len(available_models)} 之间的数字")
+                        attempts += 1
+                except ValueError:
+                    print("❌ 请输入有效的数字")
+                    attempts += 1
+                except (KeyboardInterrupt, EOFError):
+                    print("\n\n用户取消操作")
+                    sys.exit(0)
+            
+            if attempts >= max_attempts:
+                print(f"\n❌ 错误: 超过最大尝试次数，使用默认模型")
+                model = available_models[0] if available_models else DEFAULT_MODEL
+                print(f"✓ 使用模型: {model}")
    
     # 创建分析编排器
     orchestrator = APKAnalysisOrchestrator(
-        models=models,
-        apk_path=args.apk
+        models=[model],
+        apk_path=args.apk,
+        requirements=requirements
     )
    
     # 开始分析
