@@ -53,6 +53,7 @@ def find_ollama_path() -> str:
 
 
 OLLAMA_PATH = find_ollama_path()
+DEFAULT_MODEL = 'qwen2.5:32b'
 
 
 def get_ollama_models() -> List[str]:
@@ -76,7 +77,8 @@ def get_ollama_models() -> List[str]:
                             models.append(model_name)
             return models
     except Exception as e:
-        print(f"获取模型列表失败: {e}")
+        print(f"⚠️  获取Ollama模型列表失败: {e}")
+        print(f"    请确保Ollama正在运行并且可以访问")
     return []
 
 
@@ -1367,7 +1369,7 @@ async def main():
         available_models = get_ollama_models()
         if not available_models:
             print("⚠️  警告: 无法获取模型列表，使用默认模型")
-            model = 'qwen2.5:32b'
+            model = DEFAULT_MODEL
         else:
             print("\n可用的Ollama模型列表:")
             for i, m in enumerate(available_models, 1):
@@ -1395,7 +1397,7 @@ async def main():
             
             if attempts >= max_attempts:
                 print(f"\n❌ 错误: 超过最大尝试次数，使用默认模型")
-                model = available_models[0] if available_models else 'qwen2.5:32b'
+                model = available_models[0] if available_models else DEFAULT_MODEL
                 print(f"✓ 使用模型: {model}")
    
     # 创建分析编排器
