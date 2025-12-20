@@ -29,6 +29,8 @@ import requests
 DECOMPILE_TIMEOUT = 300  # 反编译超时时间（秒）
 PACKER_CONFIDENCE_MULTIPLIER = 30  # 加壳检测置信度乘数
 MAX_SCAN_FILES = 50  # 代码扫描最大文件数
+DB_SAMPLE_ROWS = 10  # 数据库样本数据行数
+DB_REPORT_ROWS = 5  # 报告中显示的样本数据行数
 
 
 def find_ollama_path() -> str:
@@ -854,8 +856,11 @@ class APKExtractor:
                 
                 for table in tables:
                     table_name = table[0]
-                    # 验证表名以防止SQL注入（虽然来自sqlite_master，但为了安全起见）
-                    # SQLite表名只能包含字母、数字、下划线
+                    # 验证表名以防止潜在的SQL注入
+                    # 虽然表名来自sqlite_master（可信源），但我们仍进行验证
+                    # 注意：SQLite不支持表名的参数化查询，因此我们使用以下方法：
+                    # 1. 验证表名只包含安全字符（字母、数字、下划线）
+                    # 2. 使用双引号包裹表名（SQLite标准做法）
                     if not all(c.isalnum() or c == '_' for c in table_name):
                         continue
                     
@@ -878,8 +883,8 @@ class APKExtractor:
                     table_info['row_count'] = cursor.fetchone()[0]
                     result['total_records'] += table_info['row_count']
                     
-                    # 获取样本数据（前10行）
-                    cursor.execute(f'SELECT * FROM "{table_name}" LIMIT 10')
+                    # 获取样本数据
+                    cursor.execute(f'SELECT * FROM "{table_name}" LIMIT {DB_SAMPLE_ROWS}')
                     table_info['sample_data'] = cursor.fetchall()
                     
                     # 检测敏感数据
@@ -2182,10 +2187,10 @@ DEX文件数: {self.apk_info['dex']['count']}
                                 
                                 # 样本数据（脱敏处理）
                                 if table.get('sample_data') and len(table.get('sample_data', [])) > 0:
-                                    f.write(f"##### 样本数据（前5行，已脱敏）\n\n")
+                                    f.write(f"##### 样本数据（前{DB_REPORT_ROWS}行，已脱敏）\n\n")
                                     
                                     columns = table.get('columns', [])
-                                    sample_data = table.get('sample_data', [])[:5]
+                                    sample_data = table.get('sample_data', [])[:DB_REPORT_ROWS]
                                     
                                     # 表头
                                     f.write(f"| {' | '.join([col['name'] for col in columns])} |\n")
