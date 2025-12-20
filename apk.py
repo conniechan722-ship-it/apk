@@ -20,6 +20,8 @@ import tempfile
 import random
 import traceback
 from tqdm import tqdm
+import aiohttp
+import requests
 
 
 # 常量定义
@@ -84,29 +86,21 @@ def find_decompiler_tools() -> Dict[str, str]:
     return tools
 
 
-def get_ollama_models() -> List[str]:
-    """获取 Ollama 已安装的模型列表"""
+def get_ollama_models(base_url: str = "http://127.0.0.1:11434") -> List[str]:
+    """从Ollama API获取已安装的模型列表"""
     try:
-        result = subprocess.run(
-            [OLLAMA_PATH, 'list'],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            models = []
-            # 检查是否至少有标题行和一行数据
-            if len(lines) > 1:
-                for line in lines[1:]:  # 跳过标题行
-                    if line.strip():
-                        parts = line.split()
-                        if parts:  # 确保行不为空
-                            model_name = parts[0]
-                            models.append(model_name)
+        response = requests.get(f"{base_url}/api/tags", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            models = [model["name"] for model in data.get("models", [])]
             return models
+        else:
+            print(f"⚠️ 获取模型列表失败: HTTP {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        print(f"⚠️ 无法连接到Ollama服务 ({base_url})")
+        print(f"    请确保Ollama正在运行: ollama serve")
     except Exception as e:
-        print(f"⚠️  获取Ollama模型列表失败: {e}")
-        print(f"    请确保Ollama正在运行并且可以访问")
+        print(f"⚠️ 获取模型列表失败: {e}")
     return []
 
 
@@ -856,45 +850,51 @@ class APKExtractor:
 
 
 class OllamaClient:
-    """Ollama客户端封装"""
-   
-    def __init__(self, model_name: str):
+    """Ollama客户端封装 - 使用HTTP API"""
+    
+    def __init__(self, model_name: str, base_url: str = "http://127.0.0.1:11434"):
         self.model_name = model_name
-       
+        self.base_url = base_url
+        
     async def generate(self, prompt: str, context: str = "") -> str:
-        """调用Ollama生成回复"""
+        """调用Ollama API生成回复"""
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
-       
+        
+        url = f"{self.base_url}/api/generate"
+        payload = {
+            "model": self.model_name,
+            "prompt": full_prompt,
+            "stream": False
+        }
+        
         try:
-            process = await asyncio.create_subprocess_exec(
-                OLLAMA_PATH, 'run', self.model_name, full_prompt,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-           
-            if process.returncode != 0:
-                error_msg = stderr.decode('utf-8', errors='ignore')
-                raise Exception(f"Ollama错误: {error_msg}")
-           
-            return stdout.decode('utf-8', errors='ignore').strip()
-        except FileNotFoundError:
-            error_msg = f"无法找到 Ollama。请确保已安装: https://ollama.ai"
-            print(f"❌ {error_msg}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("response", "").strip()
+                    else:
+                        error = await response.text()
+                        print(f"❌ Ollama API错误: {error}")
+                        return ""
+        except aiohttp.ClientConnectorError:
+            print(f"❌ 无法连接到Ollama服务 ({self.base_url})")
+            print("   请确保Ollama正在运行: ollama serve")
             return ""
         except Exception as e:
-            print(f"调用Ollama失败: {e}")
+            print(f"❌ 调用Ollama失败: {e}")
             return ""
 
 
 class AIAgent:
     """AI智能体"""
    
-    def __init__(self, agent_id: int, model_name: str, role: str):
+    def __init__(self, agent_id: int, model_name: str, role: str, base_url: str = "http://127.0.0.1:11434"):
         self.agent_id = agent_id
         self.model_name = model_name
         self.role = role
-        self.client = OllamaClient(model_name)
+        self.base_url = base_url
+        self.client = OllamaClient(model_name, base_url)
        
     async def think(self, prompt: str, context: str = "") -> str:
         """思考并生成回复"""
@@ -945,11 +945,12 @@ class AIAgent:
 class AITeam:
     """AI分析团队 - 6个专家组成"""
    
-    def __init__(self, team_id: int, role: str, models: List[str]):
+    def __init__(self, team_id: int, role: str, models: List[str], base_url: str = "http://127.0.0.1:11434"):
         self.team_id = team_id
         self.role = role
+        self.base_url = base_url
         self.agents = [
-            AIAgent(i + 1, models[i % len(models)], role)
+            AIAgent(i + 1, models[i % len(models)], role, base_url)
             for i in range(6)
         ]
        
@@ -1047,12 +1048,13 @@ class APKAnalysisOrchestrator:
     """APK分析编排器"""
    
     def __init__(self, models: List[str], apk_path: str, requirements: str = "", 
-                 enable_decompile: bool = False, output_dir: str = None):
+                 enable_decompile: bool = False, output_dir: str = None, base_url: str = "http://127.0.0.1:11434"):
         self.models = models
         self.apk_path = apk_path
         self.requirements = requirements
         self.enable_decompile = enable_decompile
         self.output_dir = output_dir
+        self.base_url = base_url
         self.extractor = APKExtractor(apk_path, enable_decompile, output_dir)
         self.apk_info = {}
         self.analysis_results = []
@@ -1075,7 +1077,7 @@ class APKAnalysisOrchestrator:
         if self.enable_decompile:
             self.decompile_info = self.extractor.decompile_apk()
        
-        team = AITeam(0, "加壳与混淆分析专家", self.models)
+        team = AITeam(0, "加壳与混淆分析专家", self.models, self.base_url)
        
         task = f"""
 请分析以下APK的加壳与混淆情况:
@@ -1143,7 +1145,7 @@ class APKAnalysisOrchestrator:
         print("阶段 1: APK构成与元数据分析")
         print("="*80)
        
-        team = AITeam(1, "APK结构与元数据分析专家", self.models)
+        team = AITeam(1, "APK结构与元数据分析专家", self.models, self.base_url)
        
         task = f"""
 请深入分析以下APK的构成与元数据:
@@ -1199,7 +1201,7 @@ class APKAnalysisOrchestrator:
         print("阶段 2: 静态代码结构与语义分析")
         print("="*80)
        
-        team = AITeam(2, "静态代码分析专家", self.models)
+        team = AITeam(2, "静态代码分析专家", self.models, self.base_url)
        
         task = f"""
 基于APK的代码结构信息，请进行静态代码分析:
@@ -1260,7 +1262,7 @@ class APKAnalysisOrchestrator:
         print("阶段 3: 混淆与加固分析")
         print("="*80)
        
-        team = AITeam(3, "代码混淆与加固分析专家", self.models)
+        team = AITeam(3, "代码混淆与加固分析专家", self.models, self.base_url)
        
         task = f"""
 请分析APK可能采用的混淆与加固技术:
@@ -1322,7 +1324,7 @@ class APKAnalysisOrchestrator:
         print("阶段 4: 动态行为与运行时特征分析")
         print("="*80)
        
-        team = AITeam(4, "动态行为分析专家", self.models)
+        team = AITeam(4, "动态行为分析专家", self.models, self.base_url)
        
         task = f"""
 请分析APK可能的动态行为和运行时特征:
@@ -1396,7 +1398,7 @@ class APKAnalysisOrchestrator:
         print("阶段 5: Native库与本地代码分析")
         print("="*80)
        
-        team = AITeam(5, "Native代码分析专家", self.models)
+        team = AITeam(5, "Native代码分析专家", self.models, self.base_url)
        
         task = f"""
 请深入分析APK的Native库与本地代码:
@@ -1463,7 +1465,7 @@ Native代码占比: {round(self.apk_info['native']['total_size'] / self.apk_info
         print("阶段 6: 网络与协议语义分析")
         print("="*80)
        
-        team = AITeam(6, "网络协议分析专家", self.models)
+        team = AITeam(6, "网络协议分析专家", self.models, self.base_url)
        
         task = f"""
 请分析APK的网络通信与协议特征:
@@ -1537,7 +1539,7 @@ Native库: {', '.join([lib['name'] for lib in self.apk_info['native']['libraries
         print("阶段 7: 签名、完整性与更新机制分析")
         print("="*80)
        
-        team = AITeam(7, "应用安全与完整性专家", self.models)
+        team = AITeam(7, "应用安全与完整性专家", self.models, self.base_url)
        
         task = f"""
 请分析APK的签名、完整性保护与更新机制:
@@ -1611,7 +1613,7 @@ Native库: {', '.join([lib['name'] for lib in self.apk_info['native']['libraries
         print("阶段 8: 反调试与反分析机制分析")
         print("="*80)
        
-        team = AITeam(8, "反调试与对抗技术专家", self.models)
+        team = AITeam(8, "反调试与对抗技术专家", self.models, self.base_url)
        
         task = f"""
 请分析APK可能采用的反调试与反分析技术:
@@ -1698,7 +1700,7 @@ DEX文件数: {self.apk_info['dex']['count']}
         # 执行代码逻辑分析
         self.code_logic_info = self.extractor.analyze_code_logic(self.decompile_info)
        
-        team = AITeam(9, "代码逻辑分析与修改建议专家", self.models)
+        team = AITeam(9, "代码逻辑分析与修改建议专家", self.models, self.base_url)
        
         task = f"""
 请基于反编译结果分析APK的代码逻辑和可修改点:
@@ -1773,7 +1775,7 @@ DEX文件数: {self.apk_info['dex']['count']}
         print("阶段 10: 综合分析报告生成")
         print("="*80)
        
-        team = AITeam(10, "安全分析总结专家", self.models)
+        team = AITeam(10, "安全分析总结专家", self.models, self.base_url)
        
         # 汇总所有分析结果
         all_analyses = "\n\n".join([
@@ -2048,6 +2050,7 @@ async def main():
     parser.add_argument('--txt', help='需求方向文件路径（可选）')
     parser.add_argument('--decompile', action='store_true', help='启用反编译分析')
     parser.add_argument('--output-dir', help='输出目录（可选）')
+    parser.add_argument('--ollama-url', default='http://127.0.0.1:11434', help='Ollama API地址（默认: http://127.0.0.1:11434）')
    
     args = parser.parse_args()
    
@@ -2074,7 +2077,7 @@ async def main():
     model = None
     if args.model:
         # 用户指定了模型，验证模型是否存在
-        available_models = get_ollama_models()
+        available_models = get_ollama_models(args.ollama_url)
         if not available_models:
             print("⚠️  警告: 无法获取模型列表，将尝试使用指定的模型")
             model = args.model
@@ -2089,7 +2092,7 @@ async def main():
             sys.exit(1)
     else:
         # 用户未指定模型，显示列表让用户选择
-        available_models = get_ollama_models()
+        available_models = get_ollama_models(args.ollama_url)
         if not available_models:
             print("⚠️  警告: 无法获取模型列表，使用默认模型")
             model = DEFAULT_MODEL
@@ -2129,7 +2132,8 @@ async def main():
         apk_path=args.apk,
         requirements=requirements,
         enable_decompile=args.decompile,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        base_url=args.ollama_url
     )
    
     # 开始分析
