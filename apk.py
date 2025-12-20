@@ -19,6 +19,7 @@ import zipfile
 import tempfile
 import random
 import traceback
+import sqlite3
 from tqdm import tqdm
 import aiohttp
 import requests
@@ -123,7 +124,6 @@ class APKExtractor:
        
         structure = {
             "file_list": [],
-            "all_files": [],
             "file_sizes": {},
             "total_size": 0,
             "dex_files": [],
@@ -136,7 +136,6 @@ class APKExtractor:
         try:
             with zipfile.ZipFile(self.apk_path, 'r') as zip_ref:
                 structure["file_list"] = zip_ref.namelist()
-                structure["all_files"] = zip_ref.namelist()
                 structure["total_size"] = os.path.getsize(self.apk_path)
                
                 for file_info in zip_ref.infolist():
@@ -825,7 +824,7 @@ class APKExtractor:
         """查找APK中的所有数据库文件"""
         db_files = []
         # 搜索 assets 目录和其他位置的 .db 文件
-        for file_path in structure.get('all_files', []):
+        for file_path in structure.get('file_list', []):
             if file_path.endswith('.db') or file_path.endswith('.sqlite') or file_path.endswith('.sqlite3'):
                 full_path = os.path.join(self.temp_dir, file_path)
                 db_files.append({
@@ -837,8 +836,6 @@ class APKExtractor:
    
     def analyze_database(self, db_path: str) -> Dict[str, Any]:
         """分析单个数据库文件"""
-        import sqlite3
-        
         result = {
             'path': db_path,
             'tables': [],
@@ -848,52 +845,57 @@ class APKExtractor:
         }
         
         try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            # 获取所有表名
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = cursor.fetchall()
-            
-            for table in tables:
-                table_name = table[0]
-                table_info = {
-                    'name': table_name,
-                    'columns': [],
-                    'row_count': 0,
-                    'sample_data': []
-                }
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
                 
-                # 获取表结构
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns = cursor.fetchall()
-                table_info['columns'] = [{'name': col[1], 'type': col[2]} for col in columns]
+                # 获取所有表名
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = cursor.fetchall()
                 
-                # 获取行数
-                cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-                table_info['row_count'] = cursor.fetchone()[0]
-                result['total_records'] += table_info['row_count']
-                
-                # 获取样本数据（前10行）
-                cursor.execute(f"SELECT * FROM {table_name} LIMIT 10")
-                table_info['sample_data'] = cursor.fetchall()
-                
-                # 检测敏感数据
-                sensitive_keywords = ['password', 'token', 'secret', 'key', 'auth', 'session', 
-                                      'user', 'email', 'phone', 'credential', 'cookie']
-                for col in table_info['columns']:
-                    col_name_lower = col['name'].lower()
-                    for keyword in sensitive_keywords:
-                        if keyword in col_name_lower:
-                            result['sensitive_data'].append({
-                                'table': table_name,
-                                'column': col['name'],
-                                'keyword': keyword
-                            })
-                
-                result['tables'].append(table_info)
-            
-            conn.close()
+                for table in tables:
+                    table_name = table[0]
+                    # 验证表名以防止SQL注入（虽然来自sqlite_master，但为了安全起见）
+                    # SQLite表名只能包含字母、数字、下划线
+                    if not all(c.isalnum() or c == '_' for c in table_name):
+                        continue
+                    
+                    table_info = {
+                        'name': table_name,
+                        'columns': [],
+                        'row_count': 0,
+                        'sample_data': []
+                    }
+                    
+                    # 获取表结构 - PRAGMA命令是安全的，不需要参数化
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    columns = cursor.fetchall()
+                    table_info['columns'] = [{'name': col[1], 'type': col[2]} for col in columns]
+                    
+                    # 获取行数 - 使用参数化查询
+                    # Note: SQLite doesn't support parameter substitution for table names in standard queries
+                    # But we've validated the table name above
+                    cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+                    table_info['row_count'] = cursor.fetchone()[0]
+                    result['total_records'] += table_info['row_count']
+                    
+                    # 获取样本数据（前10行）
+                    cursor.execute(f'SELECT * FROM "{table_name}" LIMIT 10')
+                    table_info['sample_data'] = cursor.fetchall()
+                    
+                    # 检测敏感数据
+                    sensitive_keywords = ['password', 'token', 'secret', 'key', 'auth', 'session', 
+                                          'user', 'email', 'phone', 'credential', 'cookie']
+                    for col in table_info['columns']:
+                        col_name_lower = col['name'].lower()
+                        for keyword in sensitive_keywords:
+                            if keyword in col_name_lower:
+                                result['sensitive_data'].append({
+                                    'table': table_name,
+                                    'column': col['name'],
+                                    'keyword': keyword
+                                })
+                    
+                    result['tables'].append(table_info)
         except Exception as e:
             result['error'] = str(e)
         
