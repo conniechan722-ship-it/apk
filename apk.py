@@ -19,6 +19,7 @@ import zipfile
 import tempfile
 import random
 import traceback
+import sqlite3
 from tqdm import tqdm
 import aiohttp
 import requests
@@ -28,6 +29,8 @@ import requests
 DECOMPILE_TIMEOUT = 300  # 反编译超时时间（秒）
 PACKER_CONFIDENCE_MULTIPLIER = 30  # 加壳检测置信度乘数
 MAX_SCAN_FILES = 50  # 代码扫描最大文件数
+DB_SAMPLE_ROWS = 10  # 数据库样本数据行数
+DB_REPORT_ROWS = 5  # 报告中显示的样本数据行数
 
 
 def find_ollama_path() -> str:
@@ -107,7 +110,7 @@ def get_ollama_models(base_url: str = "http://127.0.0.1:11434") -> List[str]:
 class APKExtractor:
     """APK信息提取器"""
    
-    def __init__(self, apk_path: str, enable_decompile: bool = False, output_dir: str = None):
+    def __init__(self, apk_path: str, enable_decompile: bool = False, output_dir: str = None, analyze_db: bool = False):
         self.apk_path = apk_path
         self.temp_dir = tempfile.mkdtemp()
         self.extracted_info = {}
@@ -115,6 +118,7 @@ class APKExtractor:
         self.output_dir = output_dir or tempfile.mkdtemp()
         self.decompile_dir = None
         self.decompiler_tools = find_decompiler_tools() if enable_decompile else {}
+        self.analyze_db = analyze_db
        
     def extract_basic_structure(self) -> Dict[str, Any]:
         """提取APK基本结构"""
@@ -818,6 +822,122 @@ class APKExtractor:
            
         return logic_info
    
+    def find_database_files(self, structure: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """查找APK中的所有数据库文件"""
+        db_files = []
+        # 搜索 assets 目录和其他位置的 .db 文件
+        for file_path in structure.get('file_list', []):
+            if file_path.endswith('.db') or file_path.endswith('.sqlite') or file_path.endswith('.sqlite3'):
+                full_path = os.path.join(self.temp_dir, file_path)
+                db_files.append({
+                    'path': file_path,
+                    'name': os.path.basename(file_path),
+                    'size': os.path.getsize(full_path) if os.path.exists(full_path) else 0
+                })
+        return db_files
+   
+    def analyze_database(self, db_path: str) -> Dict[str, Any]:
+        """分析单个数据库文件"""
+        result = {
+            'path': db_path,
+            'tables': [],
+            'total_records': 0,
+            'sensitive_data': [],
+            'error': None
+        }
+        
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 获取所有表名
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = cursor.fetchall()
+                
+                for table in tables:
+                    table_name = table[0]
+                    # 验证表名以防止潜在的SQL注入
+                    # 虽然表名来自sqlite_master（可信源），但我们仍进行验证
+                    # 注意：SQLite不支持表名的参数化查询，因此我们使用以下方法：
+                    # 1. 验证表名只包含安全字符（字母、数字、下划线）
+                    # 2. 使用双引号包裹表名（SQLite标准做法）
+                    if not all(c.isalnum() or c == '_' for c in table_name):
+                        continue
+                    
+                    table_info = {
+                        'name': table_name,
+                        'columns': [],
+                        'row_count': 0,
+                        'sample_data': []
+                    }
+                    
+                    # 获取表结构 - PRAGMA命令是安全的，不需要参数化
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    columns = cursor.fetchall()
+                    table_info['columns'] = [{'name': col[1], 'type': col[2]} for col in columns]
+                    
+                    # 获取行数 - 使用参数化查询
+                    # Note: SQLite doesn't support parameter substitution for table names in standard queries
+                    # But we've validated the table name above
+                    cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+                    table_info['row_count'] = cursor.fetchone()[0]
+                    result['total_records'] += table_info['row_count']
+                    
+                    # 获取样本数据
+                    cursor.execute(f'SELECT * FROM "{table_name}" LIMIT {DB_SAMPLE_ROWS}')
+                    table_info['sample_data'] = cursor.fetchall()
+                    
+                    # 检测敏感数据
+                    sensitive_keywords = ['password', 'token', 'secret', 'key', 'auth', 'session', 
+                                          'user', 'email', 'phone', 'credential', 'cookie']
+                    for col in table_info['columns']:
+                        col_name_lower = col['name'].lower()
+                        for keyword in sensitive_keywords:
+                            if keyword in col_name_lower:
+                                result['sensitive_data'].append({
+                                    'table': table_name,
+                                    'column': col['name'],
+                                    'keyword': keyword
+                                })
+                    
+                    result['tables'].append(table_info)
+        except Exception as e:
+            result['error'] = str(e)
+        
+        return result
+   
+    def analyze_all_databases(self) -> Dict[str, Any]:
+        """分析APK中所有的数据库文件"""
+        print("\n🗄️  正在分析数据库文件...")
+        
+        structure = self.extracted_info.get('structure', {})
+        db_files = self.find_database_files(structure)
+        
+        results = {
+            'total_databases': len(db_files),
+            'databases': []
+        }
+        
+        print(f"  ✓ 找到 {len(db_files)} 个数据库文件")
+        
+        for db_file in db_files:
+            full_path = os.path.join(self.temp_dir, db_file['path'])
+            if os.path.exists(full_path):
+                print(f"  → 分析数据库: {db_file['name']}")
+                db_analysis = self.analyze_database(full_path)
+                # Add size information from db_file
+                db_analysis['size'] = db_file.get('size', 0)
+                results['databases'].append(db_analysis)
+                
+                if db_analysis.get('error'):
+                    print(f"    ✗ 分析失败: {db_analysis['error']}")
+                else:
+                    print(f"    ✓ 找到 {len(db_analysis.get('tables', []))} 个表，共 {db_analysis.get('total_records', 0)} 条记录")
+                    if db_analysis.get('sensitive_data'):
+                        print(f"    ⚠️  发现 {len(db_analysis['sensitive_data'])} 个敏感字段")
+        
+        return results
+   
     def extract_all(self) -> Dict[str, Any]:
         """提取所有APK信息"""
         print("\n" + "="*80)
@@ -838,6 +958,10 @@ class APKExtractor:
        
         # Store for later use by other methods
         self.extracted_info = all_info
+        
+        # 添加数据库分析
+        if self.analyze_db:
+            all_info['database_analysis'] = self.analyze_all_databases()
        
         return all_info
    
@@ -1048,14 +1172,16 @@ class APKAnalysisOrchestrator:
     """APK分析编排器"""
    
     def __init__(self, models: List[str], apk_path: str, requirements: str = "", 
-                 enable_decompile: bool = False, output_dir: str = None, base_url: str = "http://127.0.0.1:11434"):
+                 enable_decompile: bool = False, output_dir: str = None, base_url: str = "http://127.0.0.1:11434", 
+                 analyze_db: bool = False):
         self.models = models
         self.apk_path = apk_path
         self.requirements = requirements
         self.enable_decompile = enable_decompile
         self.output_dir = output_dir
         self.base_url = base_url
-        self.extractor = APKExtractor(apk_path, enable_decompile, output_dir)
+        self.analyze_db = analyze_db
+        self.extractor = APKExtractor(apk_path, enable_decompile, output_dir, analyze_db)
         self.apk_info = {}
         self.analysis_results = []
         self.packer_info = {}
@@ -2003,7 +2129,98 @@ DEX文件数: {self.apk_info['dex']['count']}
                         for hs in self.code_logic_info.get('hook_suggestions', []):
                             f.write(f"- **{hs.get('target')}**: {hs.get('reason')}\n")
                         f.write(f"\n")
-               
+                
+                # 数据库分析结果
+                if self.analyze_db and 'database_analysis' in self.apk_info:
+                    db_analysis = self.apk_info['database_analysis']
+                    f.write(f"## 数据库分析\n\n")
+                    f.write(f"- **数据库文件数量:** {db_analysis.get('total_databases', 0)}\n\n")
+                    
+                    if db_analysis.get('total_databases', 0) > 0:
+                        f.write(f"### 找到的数据库文件\n\n")
+                        f.write(f"| 文件名 | 路径 | 大小 | 表数量 | 记录数 |\n")
+                        f.write(f"|--------|------|------|--------|--------|\n")
+                        
+                        for db in db_analysis.get('databases', []):
+                            db_name = os.path.basename(db.get('path', ''))
+                            db_path = db.get('path', '')
+                            # Format size
+                            size_bytes = db.get('size', 0)
+                            if size_bytes >= 1024 * 1024:
+                                db_size = f"{size_bytes / (1024 * 1024):.2f} MB"
+                            elif size_bytes >= 1024:
+                                db_size = f"{size_bytes / 1024:.2f} KB"
+                            else:
+                                db_size = f"{size_bytes} bytes"
+                            table_count = len(db.get('tables', []))
+                            total_records = db.get('total_records', 0)
+                            f.write(f"| {db_name} | {db_path} | {db_size} | {table_count} | {total_records} |\n")
+                        
+                        f.write(f"\n")
+                        
+                        # 详细分析每个数据库
+                        for db in db_analysis.get('databases', []):
+                            db_name = os.path.basename(db.get('path', ''))
+                            f.write(f"### {db_name} 详细分析\n\n")
+                            
+                            if db.get('error'):
+                                f.write(f"**错误:** {db.get('error')}\n\n")
+                                continue
+                            
+                            for table in db.get('tables', []):
+                                table_name = table.get('name', '')
+                                f.write(f"#### 表: {table_name}\n")
+                                f.write(f"- 列数: {len(table.get('columns', []))}\n")
+                                f.write(f"- 记录数: {table.get('row_count', 0)}\n\n")
+                                
+                                # 表结构
+                                if table.get('columns'):
+                                    # 检查是否有敏感列
+                                    sensitive_cols = [s['column'] for s in db.get('sensitive_data', []) if s['table'] == table_name]
+                                    
+                                    f.write(f"| 列名 | 类型 | 敏感 |\n")
+                                    f.write(f"|------|------|------|\n")
+                                    for col in table.get('columns', []):
+                                        is_sensitive = "⚠️" if col['name'] in sensitive_cols else "❌"
+                                        f.write(f"| {col['name']} | {col['type']} | {is_sensitive} |\n")
+                                    f.write(f"\n")
+                                
+                                # 样本数据（脱敏处理）
+                                if table.get('sample_data') and len(table.get('sample_data', [])) > 0:
+                                    f.write(f"##### 样本数据（前{DB_REPORT_ROWS}行，已脱敏）\n\n")
+                                    
+                                    columns = table.get('columns', [])
+                                    sample_data = table.get('sample_data', [])[:DB_REPORT_ROWS]
+                                    
+                                    # 表头
+                                    f.write(f"| {' | '.join([col['name'] for col in columns])} |\n")
+                                    f.write(f"|{'|'.join(['---' for _ in columns])}|\n")
+                                    
+                                    # 数据行（脱敏处理）
+                                    for row in sample_data:
+                                        masked_row = []
+                                        for i, col in enumerate(columns):
+                                            value = row[i] if i < len(row) else ''
+                                            # 对敏感列进行脱敏
+                                            if col['name'] in sensitive_cols:
+                                                masked_row.append('[REDACTED]')
+                                            elif value is None:
+                                                masked_row.append('NULL')
+                                            elif isinstance(value, str) and len(value) > 20:
+                                                masked_row.append(value[:10] + '...')
+                                            else:
+                                                masked_row.append(str(value))
+                                        f.write(f"| {' | '.join(masked_row)} |\n")
+                                    f.write(f"\n")
+                            
+                            # 敏感数据汇总
+                            if db.get('sensitive_data'):
+                                f.write(f"#### 敏感数据检测\n\n")
+                                f.write(f"发现 {len(db.get('sensitive_data', []))} 个敏感字段:\n\n")
+                                for sensitive in db.get('sensitive_data', []):
+                                    f.write(f"- **{sensitive.get('table')}.{sensitive.get('column')}** (关键词: {sensitive.get('keyword')})\n")
+                                f.write(f"\n")
+                
                 f.write(f"---\n\n")
                
                 for result in self.analysis_results:
@@ -2038,6 +2255,9 @@ async def main():
   # 完整分析
   python apk.py --apk app.apk --model qwen2.5-coder:7b --decompile --txt requirements.txt --output-dir ./output
 
+  # 启用数据库分析
+  python apk.py --apk app.apk --model qwen2.5-coder:7b --analyze-db
+
 注意: 需要安装以下工具以获得更完整的分析结果:
   - aapt (Android Asset Packaging Tool)
   - jadx (APK反编译为Java代码，使用 --decompile 时需要)
@@ -2049,6 +2269,7 @@ async def main():
     parser.add_argument('--model', help='指定要使用的Ollama模型（可选）')
     parser.add_argument('--txt', help='需求方向文件路径（可选）')
     parser.add_argument('--decompile', action='store_true', help='启用反编译分析')
+    parser.add_argument('--analyze-db', action='store_true', help='启用数据库深度分析')
     parser.add_argument('--output-dir', help='输出目录（可选）')
     parser.add_argument('--ollama-url', default='http://127.0.0.1:11434', help='Ollama API地址（默认: http://127.0.0.1:11434）')
    
@@ -2133,7 +2354,8 @@ async def main():
         requirements=requirements,
         enable_decompile=args.decompile,
         output_dir=args.output_dir,
-        base_url=args.ollama_url
+        base_url=args.ollama_url,
+        analyze_db=args.analyze_db
     )
    
     # 开始分析
